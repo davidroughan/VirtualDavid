@@ -1,0 +1,402 @@
+<cfcomponent displayname="Ingestor" output="false"
+    hint="Walks a repo's local filesystem path, chunks text files, embeds each chunk via Azure, and stores normalised vectors. Incremental: unchanged files (by SHA-256) are skipped.">
+
+    <cffunction name="init" access="public" returntype="Ingestor" output="false">
+        <cfset variables.oai    = createObject("component", "cfcs.AzureOpenAI")>
+        <cfset variables.store  = createObject("component", "cfcs.VectorStore")>
+        <cfreturn this>
+    </cffunction>
+
+    <!--- ====================================================================
+          Repo management
+          ==================================================================== --->
+
+    <cffunction name="addRepo" access="public" returntype="numeric" output="false">
+        <cfargument name="name"       type="string"  required="true">
+        <cfargument name="localPath"  type="string"  required="true">
+        <cfargument name="extensions" type="string"  required="false" default="">
+        <cfargument name="maxFileKb"  type="numeric" required="false" default="0">
+        <cfargument name="exclude"    type="string"  required="false" default="\.git\,\.claude\,\.svn\,\.vs\,\node_modules\,\bin\,\obj\,\min\,.min.js">
+
+        <cfset var insertResult = "">
+        <cfset var newId = 0>
+        <cfset var ext = len(arguments.extensions) ? arguments.extensions : request.ingest.defaultExtensions>
+        <cfset var mkb = arguments.maxFileKb gt 0 ? arguments.maxFileKb : request.ingest.maxFileKb>
+
+        <cfquery attributeCollection="#request.queryAttributes#" result="insertResult">
+            insert into repos (name, local_path, include_extensions, exclude_patterns, max_file_kb)
+            values (
+                <cfqueryparam cfsqltype="cf_sql_nvarchar" value="#arguments.name#"      maxlength="200">,
+                <cfqueryparam cfsqltype="cf_sql_nvarchar" value="#arguments.localPath#" maxlength="500">,
+                <cfqueryparam cfsqltype="cf_sql_nvarchar" value="#ext#"                 maxlength="500">,
+                <cfqueryparam cfsqltype="cf_sql_nvarchar" value="#arguments.exclude#"   maxlength="1000" null="#(NOT len(arguments.exclude))#">,
+                <cfqueryparam cfsqltype="cf_sql_integer"  value="#mkb#">
+            )
+        </cfquery>
+        <cfif isStruct(insertResult) AND structKeyExists(insertResult, "generatedKey")>
+            <cfset newId = val(insertResult.generatedKey)>
+        <cfelseif isStruct(insertResult) AND structKeyExists(insertResult, "GENERATED_KEY")>
+            <cfset newId = val(insertResult["GENERATED_KEY"])>
+        </cfif>
+        <cfreturn newId>
+    </cffunction>
+
+    <cffunction name="getRepos" access="public" returntype="query" output="false">
+        <cfset var rows = "">
+        <cfquery name="rows" attributeCollection="#request.queryAttributes#">
+            select r.repo_id, r.name, r.local_path, r.include_extensions, r.exclude_patterns,
+                   r.max_file_kb, r.enabled, r.last_indexed,
+                   (select count(*) from code_files f where f.repo_id = r.repo_id and f.is_deleted = 0) as file_count,
+                   (select count(*) from code_chunks c where c.repo_id = r.repo_id) as chunk_count
+            from repos r
+            order by r.name
+        </cfquery>
+        <cfreturn rows>
+    </cffunction>
+
+    <!--- Hard-delete all indexed data for a repo (chunks + file rows), keeping
+          the repo row and its config. Use to start a repo's ingest from zero. --->
+    <cffunction name="purgeRepo" access="public" returntype="struct" output="false">
+        <cfargument name="repoId" type="numeric" required="true">
+        <cfset var chunkResult = "">
+        <cfset var fileResult = "">
+
+        <!--- chunks first: code_chunks FKs code_files --->
+        <cfquery attributeCollection="#request.queryAttributes#" result="chunkResult">
+            delete from code_chunks
+            where repo_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#arguments.repoId#">
+        </cfquery>
+        <cfquery attributeCollection="#request.queryAttributes#" result="fileResult">
+            delete from code_files
+            where repo_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#arguments.repoId#">
+        </cfquery>
+        <cfquery attributeCollection="#request.queryAttributes#">
+            update repos set last_indexed = null
+            where repo_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#arguments.repoId#">
+        </cfquery>
+
+        <!--- drop the purged vectors from the in-memory search index --->
+        <cfset variables.store.rebuildIndexCache()>
+
+        <cfreturn {
+            "chunksDeleted" = (isStruct(chunkResult) AND structKeyExists(chunkResult, "recordCount")) ? chunkResult.recordCount : 0,
+            "filesDeleted"  = (isStruct(fileResult)  AND structKeyExists(fileResult,  "recordCount")) ? fileResult.recordCount  : 0
+        }>
+    </cffunction>
+
+    <!--- Update a repo's exclude patterns (csv of path substrings to skip). --->
+    <cffunction name="setExcludes" access="public" returntype="void" output="false">
+        <cfargument name="repoId"   type="numeric" required="true">
+        <cfargument name="patterns" type="string"  required="true">
+        <cfquery attributeCollection="#request.queryAttributes#">
+            update repos
+            set exclude_patterns = <cfqueryparam cfsqltype="cf_sql_nvarchar" value="#trim(arguments.patterns)#" maxlength="1000" null="#(NOT len(trim(arguments.patterns)))#">
+            where repo_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#arguments.repoId#">
+        </cfquery>
+    </cffunction>
+
+    <!--- ====================================================================
+          Ingestion
+          ==================================================================== --->
+
+    <cffunction name="ingestRepo" access="public" returntype="struct" output="false">
+        <cfargument name="repoId" type="numeric" required="true">
+
+        <cfset var repo = "">
+        <cfset var dirList = "">
+        <cfset var fullPath = "">
+        <cfset var relPath = "">
+        <cfset var extOk = "">
+        <cfset var allowedExt = "">
+        <cfset var excludes = "">
+        <cfset var maxBytes = 0>
+        <cfset var content = "">
+        <cfset var fileHash = "">
+        <cfset var existing = "">
+        <cfset var fileId = 0>
+        <cfset var seenPaths = {}>
+        <cfset var summary = {
+            "repoId" = arguments.repoId, "scanned" = 0, "skipped" = 0,
+            "changed" = 0, "newFiles" = 0, "chunksWritten" = 0,
+            "deleted" = 0, "errors" = []
+        }>
+        <cfset var thisExt = "">
+        <cfset var skipThis = false>
+        <cfset var exItem = "">
+
+        <!--- Load repo --->
+        <cfquery name="repo" attributeCollection="#request.queryAttributes#">
+            select repo_id, name, local_path, include_extensions, exclude_patterns, max_file_kb
+            from repos
+            where repo_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#arguments.repoId#">
+        </cfquery>
+        <cfif repo.recordCount eq 0>
+            <cfthrow message="Repo ##arguments.repoId## not found">
+        </cfif>
+        <cfif NOT directoryExists(repo.local_path)>
+            <cfthrow message="Repo path does not exist on disk: #repo.local_path#">
+        </cfif>
+
+        <cfset allowedExt = repo.include_extensions>
+        <cfset excludes    = len(repo.exclude_patterns) ? repo.exclude_patterns : "">
+        <cfset maxBytes    = val(repo.max_file_kb) * 1024>
+
+        <!--- Walk the tree --->
+        <cfdirectory action="list" directory="#repo.local_path#" recurse="true"
+                     type="file" name="dirList">
+
+        <cfloop query="dirList">
+            <cfset fullPath = dirList.directory & "\" & dirList.name>
+
+            <!--- extension filter --->
+            <cfset thisExt = lcase(listLast(dirList.name, "."))>
+            <cfif NOT listFindNoCase(allowedExt, thisExt)>
+                <cfcontinue>
+            </cfif>
+
+            <!--- size filter --->
+            <cfif maxBytes gt 0 AND dirList.size gt maxBytes>
+                <cfcontinue>
+            </cfif>
+
+            <!--- exclude-substring filter --->
+            <cfset skipThis = false>
+            <cfloop list="#excludes#" index="exItem">
+                <cfif len(trim(exItem)) AND findNoCase(trim(exItem), fullPath)>
+                    <cfset skipThis = true>
+                    <cfbreak>
+                </cfif>
+            </cfloop>
+            <cfif skipThis><cfcontinue></cfif>
+
+            <cfset relPath = relativePath(repo.local_path, fullPath)>
+            <cfset seenPaths[lcase(relPath)] = true>
+            <cfset summary.scanned++>
+
+            <cfset fileId = 0>
+            <cftry>
+                <!--- read + hash --->
+                <cffile action="read" file="#fullPath#" variable="content" charset="utf-8">
+                <cfset fileHash = lcase(hash(content, "SHA-256"))>
+
+                <!--- existing file row? --->
+                <cfquery name="existing" attributeCollection="#request.queryAttributes#">
+                    select file_id, file_hash, is_deleted
+                    from code_files
+                    where repo_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#repo.repo_id#">
+                      and relative_path = <cfqueryparam cfsqltype="cf_sql_nvarchar" value="#relPath#" maxlength="500">
+                </cfquery>
+
+                <cfif existing.recordCount AND existing.file_hash eq fileHash AND existing.is_deleted eq 0>
+                    <!--- unchanged - skip --->
+                    <cfset summary.skipped++>
+                    <cfcontinue>
+                </cfif>
+
+                <!--- upsert the file row --->
+                <cfif existing.recordCount>
+                    <cfset fileId = existing.file_id>
+                    <cfset summary.changed++>
+                    <cfquery attributeCollection="#request.queryAttributes#">
+                        update code_files
+                        set file_hash = <cfqueryparam cfsqltype="cf_sql_char" value="#fileHash#" maxlength="64">,
+                            size_bytes = <cfqueryparam cfsqltype="cf_sql_integer" value="#len(content)#">,
+                            language = <cfqueryparam cfsqltype="cf_sql_varchar" value="#thisExt#" maxlength="50">,
+                            is_deleted = 0,
+                            indexed_at = getDate()
+                        where file_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#fileId#">
+                    </cfquery>
+                    <cfset variables.store.deleteChunksForFile(fileId)>
+                <cfelse>
+                    <cfset summary.newFiles++>
+                    <cfset fileId = insertFileRow(repo.repo_id, relPath, fileHash, len(content), thisExt)>
+                </cfif>
+
+                <!--- chunk + embed --->
+                <cfset summary.chunksWritten += embedFileChunks(repo.repo_id, fileId, relPath, content)>
+
+            <cfcatch type="any">
+                <cfset arrayAppend(summary.errors, relPath & " :: " & cfcatch.message)>
+                <!--- A failed file may be half-chunked but hash-marked, which
+                      would skip it forever. Blank its hash so it retries next run. --->
+                <cfif fileId gt 0>
+                    <cftry>
+                        <cfquery attributeCollection="#request.queryAttributes#">
+                            update code_files set file_hash = ''
+                            where file_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#fileId#">
+                        </cfquery>
+                        <cfcatch type="any"></cfcatch>
+                    </cftry>
+                </cfif>
+            </cfcatch>
+            </cftry>
+        </cfloop>
+
+        <!--- mark files that vanished from disk --->
+        <cfset summary.deleted = markMissingFiles(repo.repo_id, seenPaths)>
+
+        <!--- stamp last_indexed --->
+        <cfquery attributeCollection="#request.queryAttributes#">
+            update repos set last_indexed = getDate()
+            where repo_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#repo.repo_id#">
+        </cfquery>
+
+        <!--- refresh the in-memory search index --->
+        <cfset variables.store.rebuildIndexCache()>
+
+        <cfreturn summary>
+    </cffunction>
+
+    <!--- ====================================================================
+          Helpers
+          ==================================================================== --->
+
+    <cffunction name="insertFileRow" access="private" returntype="numeric" output="false">
+        <cfargument name="repoId"   type="numeric" required="true">
+        <cfargument name="relPath"  type="string"  required="true">
+        <cfargument name="fileHash" type="string"  required="true">
+        <cfargument name="sizeBytes" type="numeric" required="true">
+        <cfargument name="language" type="string"  required="true">
+
+        <cfset var insertResult = "">
+        <cfset var newId = 0>
+        <cfquery attributeCollection="#request.queryAttributes#" result="insertResult">
+            insert into code_files (repo_id, relative_path, file_hash, size_bytes, language, chunk_count)
+            values (
+                <cfqueryparam cfsqltype="cf_sql_integer"  value="#arguments.repoId#">,
+                <cfqueryparam cfsqltype="cf_sql_nvarchar" value="#arguments.relPath#" maxlength="500">,
+                <cfqueryparam cfsqltype="cf_sql_char"     value="#arguments.fileHash#" maxlength="64">,
+                <cfqueryparam cfsqltype="cf_sql_integer"  value="#arguments.sizeBytes#">,
+                <cfqueryparam cfsqltype="cf_sql_varchar"  value="#arguments.language#" maxlength="50">,
+                0
+            )
+        </cfquery>
+        <cfif isStruct(insertResult) AND structKeyExists(insertResult, "generatedKey")>
+            <cfset newId = val(insertResult.generatedKey)>
+        <cfelseif isStruct(insertResult) AND structKeyExists(insertResult, "GENERATED_KEY")>
+            <cfset newId = val(insertResult["GENERATED_KEY"])>
+        </cfif>
+        <cfreturn newId>
+    </cffunction>
+
+    <!--- Split content into line-based chunks, embed each, store. Returns count. --->
+    <cffunction name="embedFileChunks" access="private" returntype="numeric" output="false">
+        <cfargument name="repoId"  type="numeric" required="true">
+        <cfargument name="fileId"  type="numeric" required="true">
+        <cfargument name="relPath" type="string"  required="true">
+        <cfargument name="content" type="string"  required="true">
+
+        <cfset var lines = "">
+        <cfset var totalLines = 0>
+        <cfset var chunkLines = val(request.ingest.chunkLines)>
+        <cfset var overlap = val(request.ingest.chunkOverlap)>
+        <cfset var maxChars = val(request.ingest.maxChunkChars)>
+        <cfset var step = max(1, chunkLines - overlap)>
+        <cfset var startIdx = 1>
+        <cfset var endIdx = 0>
+        <cfset var chunkIndex = 0>
+        <cfset var i = 0>
+        <cfset var chunkText = "">
+        <cfset var embedInput = "">
+        <cfset var emb = "">
+        <cfset var normVec = "">
+        <cfset var written = 0>
+        <cfset var slice = "">
+
+        <!--- normalise line endings then split keeping blank lines --->
+        <cfset lines = listToArray(replace(arguments.content, chr(13), "", "all"), chr(10), true)>
+        <cfset totalLines = arrayLen(lines)>
+        <cfif totalLines eq 0><cfreturn 0></cfif>
+
+        <cfloop condition="startIdx lte totalLines">
+            <cfset endIdx = min(startIdx + chunkLines - 1, totalLines)>
+
+            <!--- build chunk text from the line slice --->
+            <cfset slice = []>
+            <cfloop from="#startIdx#" to="#endIdx#" index="i">
+                <cfset arrayAppend(slice, lines[i])>
+            </cfloop>
+            <cfset chunkText = arrayToList(slice, chr(10))>
+
+            <cfif maxChars gt 0 AND len(chunkText) gt maxChars>
+                <cfset chunkText = left(chunkText, maxChars)>
+            </cfif>
+
+            <cfif len(trim(chunkText))>
+                <cfset chunkIndex++>
+                <!--- embed path + lines + code so filename queries retrieve too --->
+                <cfset embedInput = "File: " & arguments.relPath & " (lines " & startIdx & "-" & endIdx & ")" & chr(10) & chunkText>
+                <cfset emb = variables.oai.callEmbeddings(inputText = embedInput, purpose = "ingest_embedding")>
+
+                <cfif emb.success AND arrayLen(emb.vector)>
+                    <cfset normVec = variables.store.normalise(emb.vector)>
+                    <cfset variables.store.insertChunk(
+                        fileId        = arguments.fileId,
+                        repoId        = arguments.repoId,
+                        chunkIndex    = chunkIndex,
+                        startLine     = startIdx,
+                        endLine       = endIdx,
+                        content       = chunkText,
+                        tokenEstimate = ceiling(len(chunkText) / 4),
+                        embedding     = normVec,
+                        embeddingModel = request.openAI_embeddingModel
+                    )>
+                    <cfset written++>
+                <cfelse>
+                    <cfthrow message="Embedding failed for #arguments.relPath# chunk #chunkIndex#: #emb.errorMessage#">
+                </cfif>
+            </cfif>
+
+            <cfif endIdx eq totalLines><cfbreak></cfif>
+            <cfset startIdx += step>
+        </cfloop>
+
+        <!--- record chunk count on the file --->
+        <cfquery attributeCollection="#request.queryAttributes#">
+            update code_files set chunk_count = <cfqueryparam cfsqltype="cf_sql_integer" value="#written#">
+            where file_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#arguments.fileId#">
+        </cfquery>
+
+        <cfreturn written>
+    </cffunction>
+
+    <!--- Mark DB files not seen on disk this run as deleted, and drop their chunks. --->
+    <cffunction name="markMissingFiles" access="private" returntype="numeric" output="false">
+        <cfargument name="repoId"    type="numeric" required="true">
+        <cfargument name="seenPaths" type="struct"  required="true">
+
+        <cfset var rows = "">
+        <cfset var removed = 0>
+        <cfquery name="rows" attributeCollection="#request.queryAttributes#">
+            select file_id, relative_path
+            from code_files
+            where repo_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#arguments.repoId#">
+              and is_deleted = 0
+        </cfquery>
+        <cfloop query="rows">
+            <cfif NOT structKeyExists(arguments.seenPaths, lcase(rows.relative_path))>
+                <cfset variables.store.deleteChunksForFile(rows.file_id)>
+                <cfquery attributeCollection="#request.queryAttributes#">
+                    update code_files set is_deleted = 1, chunk_count = 0
+                    where file_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#rows.file_id#">
+                </cfquery>
+                <cfset removed++>
+            </cfif>
+        </cfloop>
+        <cfreturn removed>
+    </cffunction>
+
+    <!--- Compute a repo-relative path from an absolute path. --->
+    <cffunction name="relativePath" access="private" returntype="string" output="false">
+        <cfargument name="base" type="string" required="true">
+        <cfargument name="full" type="string" required="true">
+        <cfset var b = arguments.base>
+        <cfset var rel = "">
+        <cfif right(b, 1) neq "\" AND right(b, 1) neq "/">
+            <cfset b = b & "\">
+        </cfif>
+        <cfset rel = replaceNoCase(arguments.full, b, "", "one")>
+        <cfreturn replace(rel, "\", "/", "all")>
+    </cffunction>
+
+</cfcomponent>

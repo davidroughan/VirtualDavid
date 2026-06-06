@@ -1,0 +1,7 @@
+# Secrets - real config holds API keys
+config.cfm
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.log
