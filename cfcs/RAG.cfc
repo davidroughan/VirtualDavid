@@ -2,8 +2,9 @@
     hint="Answers a developer's question as Virtual David: embeds the question, retrieves the most relevant code chunks, and asks the chat model to answer in David's voice grounded in that context.">
 
     <cffunction name="init" access="public" returntype="RAG" output="false">
-        <cfset variables.oai   = createObject("component", "cfcs.AzureOpenAI")>
-        <cfset variables.store = createObject("component", "cfcs.VectorStore")>
+        <cfset variables.oai     = createObject("component", "cfcs.AzureOpenAI")>
+        <cfset variables.store   = createObject("component", "cfcs.VectorStore")>
+        <cfset variables.prompts = createObject("component", "cfcs.PromptStore")>
         <cfreturn this>
     </cffunction>
 
@@ -98,11 +99,11 @@
         <cfset var sb = "">
         <cfset var i = 0>
 
-        <!--- David's persona, written once, lives at the app root --->
-        <cftry>
-            <cffile action="read" file="#request.appRoot#SystemPrompt.txt" variable="persona" charset="utf-8">
-            <cfcatch type="any"><cfset persona = "You are Virtual David, an Australian ColdFusion/JavaScript developer. Be direct, concise and practical."></cfcatch>
-        </cftry>
+        <!--- David's persona, edited via admin/prompt.cfm and stored in the DB so
+              the prod 'ask' module reads it from the shared database (no reliance
+              on a SystemPrompt.txt on the prod filesystem). Falls back to a
+              hardcoded persona if the row is missing. --->
+        <cfset persona = variables.prompts.getContent()>
 
         <cfsavecontent variable="sb"><cfoutput>#persona#
 

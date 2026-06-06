@@ -63,7 +63,7 @@
 <body><div class="wrap">
 <cfoutput>
     <h1>Connectivity smoke test</h1>
-    <p style="color:##9aa0a6"><a href="ingest.cfm">repos</a> &middot; <a href="../index.cfm">ask</a></p>
+    <p style="color:##9aa0a6"><a href="ingest.cfm">repos</a> &middot; <a href="prompt.cfm">system prompt</a> &middot; <a href="../index.cfm">ask</a></p>
     <cfloop array="#checks#" index="c">
         <div class="row #c.ok ? 'ok' : 'bad'#">
             <div class="dot">#c.ok ? '&##10003;' : '&##10007;'#</div>

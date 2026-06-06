@@ -87,7 +87,7 @@
 <cfoutput>
 <div class="wrap">
     <h1>Repositories</h1>
-    <p class="sub">Vectorise codebases for Virtual David. &middot; <a href="../index.cfm">back to ask</a></p>
+    <p class="sub">Vectorise codebases for Virtual David. &middot; <a href="prompt.cfm">system prompt</a> &middot; <a href="../index.cfm">back to ask</a></p>
 
     <cfif len(notice)>
         <div class="notice #noticeClass#">#encodeForHTML(notice)#</div>
