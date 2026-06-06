@@ -1,4 +1,5 @@
 <!--- Thin endpoint: take a question, return Virtual David's answer as JSON. --->
+<cfsetting requesttimeout="300">
 <cfcontent type="application/json; charset=utf-8">
 <cfparam name="form.message" default="">
 <cfset response = { "ok" = false, "answer" = "", "sources" = [], "error" = "" }>

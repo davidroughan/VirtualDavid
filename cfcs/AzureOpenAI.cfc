@@ -294,6 +294,190 @@
 
 
     <!---
+        callEmbeddingsBatch
+        -------------------
+        Like callEmbeddings, but embeds an ARRAY of input strings in a single
+        Azure call (the embeddings endpoint accepts an "input" array). This is
+        the throughput path used by ingestion: one HTTP round-trip per batch
+        instead of per chunk, which all but eliminates 429 throttling on big
+        repos.
+
+        Returns a struct:
+            success      - boolean (HTTP 200 AND a vector for every input)
+            statusCode   - HTTP status code
+            vectors      - array of float arrays, aligned to arguments.inputs by
+                           position (data[].index). Empty on failure.
+            count        - number of vectors returned
+            usage        - { prompt_tokens, total_tokens }
+            errorMessage - populated on failure
+            durationMs   - duration of the cfhttp call
+            logId        - ai_usage_log PK (0 if logging failed)
+            attempts     - number of HTTP attempts (>1 means it retried 429/503)
+    --->
+    <cffunction name="callEmbeddingsBatch" access="public" returntype="struct" output="false">
+        <cfargument name="inputs"      type="array"   required="true">
+        <cfargument name="purpose"     type="string"  required="false" default="embedding_batch">
+        <cfargument name="endpointURL" type="string"  required="false" default="">
+        <cfargument name="apiKey"      type="string"  required="false" default="">
+        <cfargument name="modelName"   type="string"  required="false" default="">
+        <cfargument name="timeout"     type="numeric" required="false" default="120">
+        <cfargument name="maxRetries"  type="numeric" required="false" default="5">
+
+        <cfset var result = {
+            "success"      = false,
+            "statusCode"   = 0,
+            "vectors"      = [],
+            "count"        = 0,
+            "usage"        = { "prompt_tokens" = "", "total_tokens" = "" },
+            "errorMessage" = "",
+            "durationMs"   = 0,
+            "logId"        = 0,
+            "attempts"     = 0
+        }>
+        <cfset var httpResult = "">
+        <cfset var startTick = getTickCount()>
+        <cfset var endTick = startTick>
+        <cfset var parsed = {}>
+        <cfset var jsonBody = serializeJSON({ "input" = arguments.inputs })>
+        <cfset var responseSize = 0>
+        <cfset var attempt = 0>
+        <cfset var retryAfter = "">
+        <cfset var waitMs = 0>
+        <cfset var effectiveEndpoint = len(arguments.endpointURL) ? arguments.endpointURL : (isDefined("request.openAI_embeddingEndpoint") ? request.openAI_embeddingEndpoint : "")>
+        <cfset var effectiveApiKey   = len(arguments.apiKey)      ? arguments.apiKey      : (isDefined("request.openAI_apiKey")              ? request.openAI_apiKey            : "")>
+        <cfset var effectiveModel    = len(arguments.modelName)   ? arguments.modelName   : (isDefined("request.openAI_embeddingModel")      ? request.openAI_embeddingModel    : "")>
+        <cfset var fileContent = "">
+        <cfset var item = "">
+        <cfset var idx = 0>
+        <cfset var n = arrayLen(arguments.inputs)>
+        <cfset var i = 0>
+
+        <cfif n eq 0>
+            <cfset result.success = true>
+            <cfreturn result>
+        </cfif>
+
+        <!--- pre-size the output so we can place each embedding by its index --->
+        <cfloop from="1" to="#n#" index="i">
+            <cfset arrayAppend(result.vectors, [])>
+        </cfloop>
+
+        <cftry>
+            <!--- same 429/503 backoff as callEmbeddings: honour Retry-After,
+                  else exponential backoff capped at 30s, up to maxRetries. --->
+            <cfloop condition="true">
+                <cfset attempt++>
+                <cfset startTick = getTickCount()>
+                <cfhttp url="#effectiveEndpoint#"
+                        method="POST"
+                        timeout="#arguments.timeout#"
+                        result="httpResult"
+                        charset="utf-8">
+                    <cfhttpparam type="header" name="api-key"      value="#effectiveApiKey#">
+                    <cfhttpparam type="header" name="Content-Type" value="application/json">
+                    <cfhttpparam type="body"   value="#jsonBody#">
+                </cfhttp>
+                <cfset endTick = getTickCount()>
+
+                <cfset result.statusCode = val(httpResult.statusCode)>
+                <cfset result.durationMs = endTick - startTick>
+                <cfset result.attempts   = attempt>
+                <cfset fileContent = isDefined("httpResult.fileContent") ? toString(httpResult.fileContent) : "">
+                <cfset responseSize = len(fileContent)>
+
+                <cfif (result.statusCode eq 429 OR result.statusCode eq 503) AND attempt lte arguments.maxRetries>
+                    <cfset retryAfter = (isStruct(httpResult.responseHeader) AND structKeyExists(httpResult.responseHeader, "Retry-After")) ? httpResult.responseHeader["Retry-After"] : "">
+                    <cfif isNumeric(retryAfter)>
+                        <cfset waitMs = min(60, val(retryAfter)) * 1000>
+                    <cfelse>
+                        <cfset waitMs = min(30000, (2 ^ attempt) * 1000)>
+                    </cfif>
+                    <cfset sleep(waitMs)>
+                    <cfcontinue>
+                </cfif>
+                <cfbreak>
+            </cfloop>
+
+            <cfif result.statusCode neq 200>
+                <cfset result.errorMessage = "HTTP " & result.statusCode & ": " & left(fileContent, 1000)>
+            </cfif>
+
+            <cftry>
+                <cfif len(trim(fileContent))>
+                    <cfset parsed = deserializeJSON(fileContent)>
+                    <cfif isStruct(parsed)>
+                        <cfif structKeyExists(parsed, "data") AND isArray(parsed.data)>
+                            <!--- place each embedding at its 0-based index+1; the
+                                  API returns one data entry per input. --->
+                            <cfloop array="#parsed.data#" index="item">
+                                <cfif isStruct(item) AND structKeyExists(item, "embedding") AND isArray(item.embedding) AND arrayLen(item.embedding)>
+                                    <cfset idx = structKeyExists(item, "index") ? (val(item.index) + 1) : 0>
+                                    <cfif idx ge 1 AND idx le n>
+                                        <cfset result.vectors[idx] = item.embedding>
+                                    </cfif>
+                                </cfif>
+                            </cfloop>
+                            <!--- success only if EVERY input got a non-empty vector --->
+                            <cfset result.count = 0>
+                            <cfloop from="1" to="#n#" index="i">
+                                <cfif arrayLen(result.vectors[i])><cfset result.count++></cfif>
+                            </cfloop>
+                            <cfif result.statusCode eq 200 AND result.count eq n>
+                                <cfset result.success = true>
+                            </cfif>
+                        </cfif>
+                        <cfif structKeyExists(parsed, "usage") AND isStruct(parsed.usage)>
+                            <cfif structKeyExists(parsed.usage, "prompt_tokens")>
+                                <cfset result.usage.prompt_tokens = val(parsed.usage.prompt_tokens)>
+                            </cfif>
+                            <cfif structKeyExists(parsed.usage, "total_tokens")>
+                                <cfset result.usage.total_tokens = val(parsed.usage.total_tokens)>
+                            </cfif>
+                        </cfif>
+                        <cfif NOT result.success AND structKeyExists(parsed, "error") AND isStruct(parsed.error) AND structKeyExists(parsed.error, "message")>
+                            <cfset result.errorMessage = "HTTP " & result.statusCode & ": " & toString(parsed.error.message)>
+                        </cfif>
+                    </cfif>
+                </cfif>
+                <cfcatch type="any"></cfcatch>
+            </cftry>
+
+            <cfcatch type="any">
+                <cfset endTick = getTickCount()>
+                <cfset result.durationMs   = endTick - startTick>
+                <cfset result.success      = false>
+                <cfset result.statusCode   = 0>
+                <cfset result.errorMessage = "cfhttp threw: " & cfcatch.message & " | " & cfcatch.detail>
+            </cfcatch>
+        </cftry>
+
+        <cftry>
+            <cfset result.logId = logUsage(
+                purpose            = arguments.purpose,
+                endpointURL        = effectiveEndpoint,
+                modelName          = effectiveModel,
+                requestSizeBytes   = len(jsonBody),
+                responseSizeBytes  = responseSize,
+                promptTokens       = result.usage.prompt_tokens,
+                completionTokens   = "",
+                reasoningTokens    = "",
+                totalTokens        = result.usage.total_tokens,
+                durationMs         = result.durationMs,
+                httpStatusCode     = result.statusCode,
+                finishReason       = "",
+                success            = result.success,
+                errorMessage       = result.errorMessage
+            )>
+            <cfcatch type="any">
+                <cfset result.logId = 0>
+            </cfcatch>
+        </cftry>
+
+        <cfreturn result>
+    </cffunction>
+
+
+    <!---
         logUsage (private)
         ------------------
         Inserts one row into ai_usage_log on the configured datasource.
