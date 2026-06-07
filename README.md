@@ -44,10 +44,46 @@ Re-running ingest only re-embeds files whose contents changed (SHA-256), and dro
 | `cfcs/VectorStore.cfc` | Chunk persistence + in-SQL `VECTOR_DISTANCE` search. |
 | `cfcs/Ingestor.cfc` | Repo walk, incremental hashing, chunking, embedding. |
 | `cfcs/RAG.cfc` | Question → retrieve → grounded answer; logs to `chat_log`. |
+| `cfcs/EmailReader.cfc` | Parse a saved `.eml` (MIME) or `.msg` (Outlook) into headers + reply chain + attachments. Pure parsing, no DB/LLM. |
+| `cfcs/EmailIngestor.cfc` | Read an email, use the chat model to split David's inline answers from the dev's questions, embed his guidance, store via `VectorStore`. |
 | `index.cfm` / `ajax_ask.cfm` | Ask UI + JSON endpoint. |
 | `admin/ingest.cfm` | Add repos, edit excludes, ingest, reset. |
+| `admin/emails.cfm` | Preview an email's parse + reply chain, run ticket segmentation, ingest David's guidance. |
+| `lib/` | Optional POI jars for binary `.msg` support (see `lib/README.md`). `.eml` needs nothing. |
 | `admin/test.cfm` | Connectivity smoke test. |
 | `schema/00*.sql` | SQL Server DDL + the vector-search migration. |
+
+## Emails as a knowledge source
+
+A lot of David's guidance lives in email, not code. The email module turns saved
+messages into retrievable knowledge **without touching the code ingestion path**.
+
+```
+admin/emails.cfm ─▶ EmailReader.readFile          (.eml MIME / .msg Outlook)
+                     ├─ decode MIME parts, pick text/plain (HTML fallback)
+                     ├─ strip signatures / footers / cid images
+                     └─ split the forward/reply chain by Outlook's From/Sent/Subject blocks
+                  ─▶ EmailIngestor
+                     ├─ chat model splits David's INLINE "see comments below"
+                     │  answers from the dev's questions, per ticket  (purpose=email_segment)
+                     ├─ embed one self-describing chunk per ticket with guidance
+                     └─ store under a synthetic "Emails" repo via VectorStore.insertChunk
+```
+
+Why an LLM step: David answers multi-issue emails by typing replies *underneath*
+each question with **no quote markers**, so there's no reliable rule for "whose
+words are these". The model does that separation and returns structured tickets;
+only tickets carrying David's guidance are embedded.
+
+Storage reuses the existing tables — emails are chunks under an auto-created
+`Emails` repo (its `include_extensions` are inert so the code walker ignores the
+`.eml` files). That means **no schema or `VectorStore` change**, and email
+guidance is immediately retrievable through the normal ask UI. Re-ingest is
+incremental by SHA-256, same as code.
+
+Drop `.eml`/`.msg` files in `emails/`, open `admin/emails.cfm`, preview the parse,
+then **Ingest**. Binary `.msg` needs Apache POI on the classpath (`lib/README.md`);
+`.eml` works out of the box.
 
 ## Known tradeoffs / follow-ups
 

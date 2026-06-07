@@ -16,7 +16,7 @@
         <cfargument name="localPath"  type="string"  required="true">
         <cfargument name="extensions" type="string"  required="false" default="">
         <cfargument name="maxFileKb"  type="numeric" required="false" default="0">
-        <cfargument name="exclude"    type="string"  required="false" default="\.git\,\.claude\,\.svn\,\.vs\,\node_modules\,\bin\,\obj\,\min\,.min.js">
+        <cfargument name="exclude"    type="string"  required="false" default="\.git\,\.claude\,\.svn\,\.vs\,\node_modules\,\bin\,\obj\,\min\,.min.js,\fontawesome,\svgs\">
 
         <cfset var insertResult = "">
         <cfset var newId = 0>
@@ -81,6 +81,32 @@
         }>
     </cffunction>
 
+    <!--- Delete a repo entirely: its chunks, file rows, run history AND the repo
+          row itself. Children deleted first to satisfy the foreign keys. --->
+    <cffunction name="deleteRepo" access="public" returntype="struct" output="false">
+        <cfargument name="repoId" type="numeric" required="true">
+        <cfset var r = "">
+        <cfquery attributeCollection="#request.queryAttributes#">
+            delete from code_chunks where repo_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#arguments.repoId#">
+        </cfquery>
+        <cfquery attributeCollection="#request.queryAttributes#">
+            delete from code_files where repo_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#arguments.repoId#">
+        </cfquery>
+        <cfquery attributeCollection="#request.queryAttributes#">
+            delete from ingest_runs where repo_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#arguments.repoId#">
+        </cfquery>
+        <cfquery attributeCollection="#request.queryAttributes#" result="r">
+            delete from repos where repo_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#arguments.repoId#">
+        </cfquery>
+        <!--- drop any leftover live status for this repo --->
+        <cflock name="vdIngestInit" type="exclusive" timeout="10">
+            <cfif structKeyExists(application, "vdIngest") AND structKeyExists(application.vdIngest, arguments.repoId)>
+                <cfset structDelete(application.vdIngest, arguments.repoId)>
+            </cfif>
+        </cflock>
+        <cfreturn { "deleted" = (isStruct(r) AND structKeyExists(r, "recordCount")) ? r.recordCount : 0 }>
+    </cffunction>
+
     <!--- Update a repo's exclude patterns (csv of path substrings to skip). --->
     <cffunction name="setExcludes" access="public" returntype="void" output="false">
         <cfargument name="repoId"   type="numeric" required="true">
@@ -90,6 +116,205 @@
             set exclude_patterns = <cfqueryparam cfsqltype="cf_sql_nvarchar" value="#trim(arguments.patterns)#" maxlength="1000" null="#(NOT len(trim(arguments.patterns)))#">
             where repo_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#arguments.repoId#">
         </cfquery>
+    </cffunction>
+
+    <!--- ====================================================================
+          Run tracking & control
+
+          Live status lives in application.vdIngest[repoId] (fast, polled by the
+          admin page); each run is also recorded in the ingest_runs table so the
+          history survives a timeout or a CF restart. A single ingest writes its
+          own job struct; the stop flag is the one field another request writes.
+          ==================================================================== --->
+
+    <cffunction name="initRun" access="private" returntype="numeric" output="false">
+        <cfargument name="repoId" type="numeric" required="true">
+        <cfset var ins = "">
+        <cfset var runId = 0>
+        <cfquery attributeCollection="#request.queryAttributes#" result="ins">
+            insert into ingest_runs (repo_id, status, started_at, heartbeat_at)
+            values (<cfqueryparam cfsqltype="cf_sql_integer" value="#arguments.repoId#">, 'running', getDate(), getDate())
+        </cfquery>
+        <cfif isStruct(ins) AND structKeyExists(ins, "generatedKey")>
+            <cfset runId = val(ins.generatedKey)>
+        <cfelseif isStruct(ins) AND structKeyExists(ins, "GENERATED_KEY")>
+            <cfset runId = val(ins["GENERATED_KEY"])>
+        </cfif>
+        <cflock name="vdIngestInit" type="exclusive" timeout="10">
+            <cfif NOT structKeyExists(application, "vdIngest")>
+                <cfset application.vdIngest = {}>
+            </cfif>
+            <cfset application.vdIngest[arguments.repoId] = {
+                "runId" = runId, "status" = "running", "stop" = false,
+                "startedTick" = getTickCount(), "startedAt" = now(), "heartbeat" = now(),
+                "scanned" = 0, "newFiles" = 0, "changed" = 0, "skipped" = 0,
+                "deleted" = 0, "chunksWritten" = 0, "errorCount" = 0,
+                "currentFile" = "", "message" = ""
+            }>
+        </cflock>
+        <cfreturn runId>
+    </cffunction>
+
+    <!--- The live job struct for a repo, or an empty struct if none. --->
+    <cffunction name="jobRef" access="private" returntype="struct" output="false">
+        <cfargument name="repoId" type="numeric" required="true">
+        <cfif structKeyExists(application, "vdIngest") AND structKeyExists(application.vdIngest, arguments.repoId)>
+            <cfreturn application.vdIngest[arguments.repoId]>
+        </cfif>
+        <cfreturn {}>
+    </cffunction>
+
+    <!--- Cheap unlocked read of the stop flag (eventual consistency is fine). --->
+    <cffunction name="stopFlag" access="private" returntype="boolean" output="false">
+        <cfargument name="repoId" type="numeric" required="true">
+        <cfif structKeyExists(application, "vdIngest")
+              AND structKeyExists(application.vdIngest, arguments.repoId)
+              AND application.vdIngest[arguments.repoId].stop>
+            <cfreturn true>
+        </cfif>
+        <cfreturn false>
+    </cffunction>
+
+    <!--- Mirror cumulative counters + current file + heartbeat into the job. --->
+    <cffunction name="touchJob" access="private" returntype="void" output="false">
+        <cfargument name="repoId"      type="numeric" required="true">
+        <cfargument name="summary"     type="struct"  required="true">
+        <cfargument name="currentFile" type="string"  required="false" default="">
+        <cfset var j = jobRef(arguments.repoId)>
+        <cfif NOT structIsEmpty(j)>
+            <cfset j.scanned       = arguments.summary.scanned>
+            <cfset j.newFiles      = arguments.summary.newFiles>
+            <cfset j.changed       = arguments.summary.changed>
+            <cfset j.skipped       = arguments.summary.skipped>
+            <cfset j.deleted       = arguments.summary.deleted>
+            <cfset j.chunksWritten = arguments.summary.chunksWritten>
+            <cfset j.errorCount    = arrayLen(arguments.summary.errors)>
+            <cfif len(arguments.currentFile)><cfset j.currentFile = arguments.currentFile></cfif>
+            <cfset j.heartbeat     = now()>
+        </cfif>
+    </cffunction>
+
+    <!--- Persist the live counters to the ingest_runs row (throttled by caller). --->
+    <cffunction name="snapshotRun" access="private" returntype="void" output="false">
+        <cfargument name="repoId" type="numeric" required="true">
+        <cfset var j = jobRef(arguments.repoId)>
+        <cfif structIsEmpty(j) OR NOT val(j.runId)><cfreturn></cfif>
+        <cftry>
+            <cfquery attributeCollection="#request.queryAttributes#">
+                update ingest_runs set
+                    scanned = <cfqueryparam cfsqltype="cf_sql_integer" value="#j.scanned#">,
+                    new_files = <cfqueryparam cfsqltype="cf_sql_integer" value="#j.newFiles#">,
+                    changed = <cfqueryparam cfsqltype="cf_sql_integer" value="#j.changed#">,
+                    skipped = <cfqueryparam cfsqltype="cf_sql_integer" value="#j.skipped#">,
+                    deleted = <cfqueryparam cfsqltype="cf_sql_integer" value="#j.deleted#">,
+                    chunks_written = <cfqueryparam cfsqltype="cf_sql_integer" value="#j.chunksWritten#">,
+                    error_count = <cfqueryparam cfsqltype="cf_sql_integer" value="#j.errorCount#">,
+                    current_file = <cfqueryparam cfsqltype="cf_sql_nvarchar" value="#left(j.currentFile, 500)#" maxlength="500" null="#(NOT len(j.currentFile))#">,
+                    heartbeat_at = getDate()
+                where ingest_run_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#j.runId#">
+            </cfquery>
+            <cfcatch type="any"></cfcatch>
+        </cftry>
+    </cffunction>
+
+    <!--- Finalise the run: set the terminal status in the job + the DB row. --->
+    <cffunction name="finishRun" access="private" returntype="void" output="false">
+        <cfargument name="repoId"  type="numeric" required="true">
+        <cfargument name="status"  type="string"  required="true">
+        <cfargument name="message" type="string"  required="false" default="">
+        <cfset var j = jobRef(arguments.repoId)>
+        <cfif NOT structIsEmpty(j)>
+            <cfset j.status = arguments.status>
+            <cfset j.message = arguments.message>
+            <cfset j.currentFile = "">
+            <cfset j.heartbeat = now()>
+        </cfif>
+        <cfif NOT structIsEmpty(j) AND val(j.runId)>
+            <cftry>
+                <cfquery attributeCollection="#request.queryAttributes#">
+                    update ingest_runs set
+                        status = <cfqueryparam cfsqltype="cf_sql_varchar" value="#arguments.status#" maxlength="20">,
+                        finished_at = getDate(), heartbeat_at = getDate(),
+                        scanned = <cfqueryparam cfsqltype="cf_sql_integer" value="#j.scanned#">,
+                        new_files = <cfqueryparam cfsqltype="cf_sql_integer" value="#j.newFiles#">,
+                        changed = <cfqueryparam cfsqltype="cf_sql_integer" value="#j.changed#">,
+                        skipped = <cfqueryparam cfsqltype="cf_sql_integer" value="#j.skipped#">,
+                        deleted = <cfqueryparam cfsqltype="cf_sql_integer" value="#j.deleted#">,
+                        chunks_written = <cfqueryparam cfsqltype="cf_sql_integer" value="#j.chunksWritten#">,
+                        error_count = <cfqueryparam cfsqltype="cf_sql_integer" value="#j.errorCount#">,
+                        current_file = null,
+                        message = <cfqueryparam cfsqltype="cf_sql_nvarchar" value="#left(arguments.message, 2000)#" maxlength="2000" null="#(NOT len(arguments.message))#">
+                    where ingest_run_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#j.runId#">
+                </cfquery>
+                <cfcatch type="any"></cfcatch>
+            </cftry>
+        </cfif>
+    </cffunction>
+
+    <!--- Ask a running ingest to stop after its current file. Returns true if
+          there was a live run to signal. --->
+    <cffunction name="requestStop" access="public" returntype="boolean" output="false">
+        <cfargument name="repoId" type="numeric" required="true">
+        <cfset var j = jobRef(arguments.repoId)>
+        <cfif NOT structIsEmpty(j) AND j.status eq "running">
+            <cfset j.stop = true>
+            <cfreturn true>
+        </cfif>
+        <cfreturn false>
+    </cffunction>
+
+    <!--- Is an ingest for this repo live right now (running + fresh heartbeat)? --->
+    <cffunction name="isRunningNow" access="public" returntype="boolean" output="false">
+        <cfargument name="repoId" type="numeric" required="true">
+        <cfset var j = jobRef(arguments.repoId)>
+        <cfreturn (NOT structIsEmpty(j)) AND j.status eq "running" AND dateDiff("s", j.heartbeat, now()) lt 120>
+    </cffunction>
+
+    <!--- Status for the admin poller: live job struct if present, else the last
+          ingest_runs row from the DB. --->
+    <cffunction name="getRunStatus" access="public" returntype="struct" output="false">
+        <cfargument name="repoId" type="numeric" required="true">
+        <cfset var j = jobRef(arguments.repoId)>
+        <cfset var row = "">
+        <cfif NOT structIsEmpty(j)>
+            <cfreturn {
+                "found" = true, "live" = true, "runId" = j.runId, "status" = j.status,
+                "scanned" = j.scanned, "newFiles" = j.newFiles, "changed" = j.changed,
+                "skipped" = j.skipped, "deleted" = j.deleted, "chunksWritten" = j.chunksWritten,
+                "errorCount" = j.errorCount, "currentFile" = j.currentFile, "message" = j.message,
+                "startedAt" = fmtDT(j.startedAt), "finishedAt" = "",
+                "elapsedSec" = int((getTickCount() - j.startedTick) / 1000),
+                "heartbeatSecAgo" = dateDiff("s", j.heartbeat, now())
+            }>
+        </cfif>
+        <cfquery name="row" attributeCollection="#request.queryAttributes#">
+            select top 1 ingest_run_id, status, started_at, finished_at, heartbeat_at,
+                   scanned, new_files, changed, skipped, deleted, chunks_written, error_count,
+                   current_file, message
+            from ingest_runs
+            where repo_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#arguments.repoId#">
+            order by ingest_run_id desc
+        </cfquery>
+        <cfif row.recordCount>
+            <cfreturn {
+                "found" = true, "live" = false, "runId" = row.ingest_run_id, "status" = row.status,
+                "scanned" = row.scanned, "newFiles" = row.new_files, "changed" = row.changed,
+                "skipped" = row.skipped, "deleted" = row.deleted, "chunksWritten" = row.chunks_written,
+                "errorCount" = row.error_count, "currentFile" = "", "message" = row.message,
+                "startedAt" = fmtDT(row.started_at),
+                "finishedAt" = isDate(row.finished_at) ? fmtDT(row.finished_at) : "",
+                "elapsedSec" = isDate(row.finished_at) ? dateDiff("s", row.started_at, row.finished_at) : dateDiff("s", row.started_at, now()),
+                "heartbeatSecAgo" = isDate(row.heartbeat_at) ? dateDiff("s", row.heartbeat_at, now()) : ""
+            }>
+        </cfif>
+        <cfreturn { "found" = false }>
+    </cffunction>
+
+    <!--- Safe date-time formatting (avoids dateTimeFormat mask ambiguity). --->
+    <cffunction name="fmtDT" access="private" returntype="string" output="false">
+        <cfargument name="d" type="any" required="true">
+        <cfif NOT isDate(arguments.d)><cfreturn ""></cfif>
+        <cfreturn dateFormat(arguments.d, "yyyy-mm-dd") & " " & timeFormat(arguments.d, "HH:mm:ss")>
     </cffunction>
 
     <!--- ====================================================================
@@ -103,7 +328,6 @@
         <cfset var dirList = "">
         <cfset var fullPath = "">
         <cfset var relPath = "">
-        <cfset var extOk = "">
         <cfset var allowedExt = "">
         <cfset var excludes = "">
         <cfset var maxBytes = 0>
@@ -115,14 +339,21 @@
         <cfset var summary = {
             "repoId" = arguments.repoId, "scanned" = 0, "skipped" = 0,
             "changed" = 0, "newFiles" = 0, "chunksWritten" = 0,
-            "deleted" = 0, "errors" = []
+            "deleted" = 0, "errors" = [], "status" = "completed", "runId" = 0
         }>
         <cfset var thisExt = "">
         <cfset var skipThis = false>
         <cfset var exItem = "">
         <cfset var currMtime = "">
+        <cfset var startTick = getTickCount()>
+        <cfset var maxRunSeconds = (structKeyExists(request, "ingest") AND structKeyExists(request.ingest, "maxRunSeconds") AND val(request.ingest.maxRunSeconds) gt 0) ? val(request.ingest.maxRunSeconds) : 14400>
+        <cfset var aborted = false>
+        <cfset var abortStatus = "completed">
+        <cfset var abortMsg = "">
+        <cfset var snapshotEveryMs = 4000>
+        <cfset var ctl = "">
 
-        <!--- Load repo --->
+        <!--- Load repo (must exist - the run row FKs to it) --->
         <cfquery name="repo" attributeCollection="#request.queryAttributes#">
             select repo_id, name, local_path, include_extensions, exclude_patterns, max_file_kb
             from repos
@@ -131,115 +362,225 @@
         <cfif repo.recordCount eq 0>
             <cfthrow message="Repo ##arguments.repoId## not found">
         </cfif>
-        <cfif NOT directoryExists(repo.local_path)>
-            <cfthrow message="Repo path does not exist on disk: #repo.local_path#">
-        </cfif>
 
-        <cfset allowedExt = repo.include_extensions>
-        <cfset excludes    = len(repo.exclude_patterns) ? repo.exclude_patterns : "">
-        <cfset maxBytes    = val(repo.max_file_kb) * 1024>
+        <cfset summary.runId = initRun(arguments.repoId)>
+        <cfset startTick = getTickCount()>
 
-        <!--- Walk the tree --->
-        <cfdirectory action="list" directory="#repo.local_path#" recurse="true"
-                     type="file" name="dirList">
-
-        <cfloop query="dirList">
-            <cfset fullPath = dirList.directory & "\" & dirList.name>
-
-            <!--- extension filter --->
-            <cfset thisExt = lcase(listLast(dirList.name, "."))>
-            <cfif NOT listFindNoCase(allowedExt, thisExt)>
-                <cfcontinue>
+        <cftry>
+            <cfif NOT directoryExists(repo.local_path)>
+                <cfthrow message="Repo path does not exist on disk: #repo.local_path#">
             </cfif>
 
-            <!--- size filter --->
-            <cfif maxBytes gt 0 AND dirList.size gt maxBytes>
-                <cfcontinue>
-            </cfif>
+            <cfset allowedExt = repo.include_extensions>
+            <cfset excludes    = len(repo.exclude_patterns) ? repo.exclude_patterns : "">
+            <cfset maxBytes    = val(repo.max_file_kb) * 1024>
 
-            <!--- exclude-substring filter --->
-            <cfset skipThis = false>
-            <cfloop list="#excludes#" index="exItem">
-                <cfif len(trim(exItem)) AND findNoCase(trim(exItem), fullPath)>
-                    <cfset skipThis = true>
-                    <cfbreak>
-                </cfif>
-            </cfloop>
-            <cfif skipThis><cfcontinue></cfif>
+            <!--- Recursive walk that PRUNES excluded directories before descending,
+                  so .git / .claude / node_modules are never even enumerated. Keeps
+                  startup fast and the Stop signal responsive throughout the walk. --->
+            <cfset ctl = {
+                "repoId" = arguments.repoId, "aborted" = false,
+                "abortStatus" = "completed", "abortMsg" = "",
+                "startTick" = startTick, "maxRunSeconds" = maxRunSeconds,
+                "lastDbTick" = getTickCount(), "snapshotEveryMs" = snapshotEveryMs
+            }>
+            <cfset walkAndIngest(arguments.repoId, repo.local_path, repo.local_path, allowedExt, excludes, maxBytes, summary, seenPaths, ctl)>
+            <cfset aborted = ctl.aborted>
+            <cfset abortStatus = ctl.abortStatus>
+            <cfset abortMsg = ctl.abortMsg>
 
-            <cfset relPath = relativePath(repo.local_path, fullPath)>
-            <cfset seenPaths[lcase(relPath)] = true>
-            <cfset summary.scanned++>
-
-            <cfset fileId = 0>
-            <cftry>
-                <cfset currMtime = mtimeToken(dirList.dateLastModified)>
-
-                <!--- existing file row + its change-detection metadata --->
-                <cfquery name="existing" attributeCollection="#request.queryAttributes#">
-                    select file_id, file_hash, size_bytes, last_modified, is_deleted
-                    from code_files
+            <!--- Deletions + the last_indexed stamp are only valid after a FULL
+                  pass. On a stop/timeout we've walked only part of the tree, so
+                  markMissingFiles would wrongly delete every not-yet-seen file. --->
+            <cfif NOT aborted>
+                <cfset summary.deleted = markMissingFiles(repo.repo_id, seenPaths)>
+                <cfset touchJob(arguments.repoId, summary, "")>
+                <cfquery attributeCollection="#request.queryAttributes#">
+                    update repos set last_indexed = getDate()
                     where repo_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#repo.repo_id#">
-                      and relative_path = <cfqueryparam cfsqltype="cf_sql_nvarchar" value="#relPath#" maxlength="500">
                 </cfquery>
+            </cfif>
 
-                <!--- FAST PATH: on-disk size AND last-modified both match what we
-                      stored, so the content cannot have changed - skip the file
-                      without reading or hashing it. --->
-                <cfif existing.recordCount AND existing.is_deleted eq 0
-                      AND existing.size_bytes eq dirList.size
-                      AND len(existing.last_modified) AND existing.last_modified eq currMtime>
-                    <cfset summary.skipped++>
-                    <cfcontinue>
-                </cfif>
-
-                <!--- Size or mtime differs (or the file was never indexed) - read
-                      and hash to find out whether the content really changed. --->
-                <cffile action="read" file="#fullPath#" variable="content" charset="utf-8">
-                <cfset fileHash = lcase(hash(content, "SHA-256"))>
-
-                <cfif existing.recordCount AND existing.is_deleted eq 0 AND existing.file_hash eq fileHash>
-                    <!--- Content identical, only the stamp drifted (e.g. file
-                          touched, or a row migrated without a stamp). Refresh
-                          size/mtime so the next run fast-skips - no re-embed. --->
-                    <cfquery attributeCollection="#request.queryAttributes#">
-                        update code_files
-                        set size_bytes = <cfqueryparam cfsqltype="cf_sql_integer" value="#dirList.size#">,
-                            last_modified = <cfqueryparam cfsqltype="cf_sql_varchar" value="#currMtime#" maxlength="20">,
-                            indexed_at = getDate()
-                        where file_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#existing.file_id#">
-                    </cfquery>
-                    <cfset summary.skipped++>
-                    <cfcontinue>
-                </cfif>
-
-                <!--- New, or genuinely changed - upsert and re-embed. --->
-                <cfif existing.recordCount>
-                    <cfset fileId = existing.file_id>
-                    <cfset summary.changed++>
-                    <cfquery attributeCollection="#request.queryAttributes#">
-                        update code_files
-                        set file_hash = <cfqueryparam cfsqltype="cf_sql_char" value="#fileHash#" maxlength="64">,
-                            size_bytes = <cfqueryparam cfsqltype="cf_sql_integer" value="#dirList.size#">,
-                            language = <cfqueryparam cfsqltype="cf_sql_varchar" value="#thisExt#" maxlength="50">,
-                            last_modified = <cfqueryparam cfsqltype="cf_sql_varchar" value="#currMtime#" maxlength="20">,
-                            is_deleted = 0,
-                            indexed_at = getDate()
-                        where file_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#fileId#">
-                    </cfquery>
-                    <cfset variables.store.deleteChunksForFile(fileId)>
-                <cfelse>
-                    <cfset summary.newFiles++>
-                    <cfset fileId = insertFileRow(repo.repo_id, relPath, fileHash, dirList.size, thisExt, currMtime)>
-                </cfif>
-
-                <!--- chunk + embed --->
-                <cfset summary.chunksWritten += embedFileChunks(repo.repo_id, fileId, relPath, content)>
+            <cfset summary.status = aborted ? abortStatus : "completed">
+            <cfset finishRun(arguments.repoId, summary.status, abortMsg)>
 
             <cfcatch type="any">
-                <cfset arrayAppend(summary.errors, relPath & " :: " & cfcatch.message)>
-                <!--- A failed file may be half-chunked but hash-marked, which
-                      would skip it forever. Blank its hash so it retries next run. --->
+                <cfset arrayAppend(summary.errors, "RUN :: " & cfcatch.message)>
+                <cfset summary.status = "error">
+                <cfset touchJob(arguments.repoId, summary, "")>
+                <cfset finishRun(arguments.repoId, "error", cfcatch.message & " | " & cfcatch.detail)>
+            </cfcatch>
+        </cftry>
+
+        <cfreturn summary>
+    </cffunction>
+
+    <!--- ====================================================================
+          Helpers
+          ==================================================================== --->
+
+    <!--- Does a path contain any of the exclude substrings? --->
+    <cffunction name="isExcluded" access="private" returntype="boolean" output="false">
+        <cfargument name="path"     type="string" required="true">
+        <cfargument name="excludes" type="string" required="true">
+        <cfset var ex = "">
+        <cfloop list="#arguments.excludes#" index="ex">
+            <cfif len(trim(ex)) AND findNoCase(trim(ex), arguments.path)>
+                <cfreturn true>
+            </cfif>
+        </cfloop>
+        <cfreturn false>
+    </cffunction>
+
+    <!--- Set the abort flags on the control struct if a stop was requested or the
+          max run time is reached. Returns true when the walk should unwind. --->
+    <cffunction name="checkStopTimeout" access="private" returntype="boolean" output="false">
+        <cfargument name="ctl" type="struct" required="true">
+        <cfif stopFlag(arguments.ctl.repoId)>
+            <cfset arguments.ctl.aborted = true>
+            <cfset arguments.ctl.abortStatus = "stopped">
+            <cfset arguments.ctl.abortMsg = "Stopped by user.">
+            <cfreturn true>
+        </cfif>
+        <cfif (getTickCount() - arguments.ctl.startTick) gte (arguments.ctl.maxRunSeconds * 1000)>
+            <cfset arguments.ctl.aborted = true>
+            <cfset arguments.ctl.abortStatus = "timedout">
+            <cfset arguments.ctl.abortMsg = "Reached the max run time (#arguments.ctl.maxRunSeconds#s) - re-run to continue from where it stopped.">
+            <cfreturn true>
+        </cfif>
+        <cfreturn false>
+    </cffunction>
+
+    <!--- Recursively walk a directory, pruning excluded subdirectories BEFORE
+          descending (so .git / .claude / node_modules are never enumerated).
+          Checks stop/timeout and updates progress on every entry, so the walk is
+          responsive and visible from the first second. --->
+    <cffunction name="walkAndIngest" access="private" returntype="void" output="false">
+        <cfargument name="repoId"     type="numeric" required="true">
+        <cfargument name="repoPath"   type="string"  required="true">
+        <cfargument name="dir"        type="string"  required="true">
+        <cfargument name="allowedExt" type="string"  required="true">
+        <cfargument name="excludes"   type="string"  required="true">
+        <cfargument name="maxBytes"   type="numeric" required="true">
+        <cfargument name="summary"    type="struct"  required="true">
+        <cfargument name="seenPaths"  type="struct"  required="true">
+        <cfargument name="ctl"        type="struct"  required="true">
+
+        <cfset var entries = "">
+        <cfset var childPath = "">
+        <cfset var thisExt = "">
+        <cfset var relPath = "">
+
+        <cfif arguments.ctl.aborted><cfreturn></cfif>
+
+        <cfdirectory action="list" directory="#arguments.dir#" type="all" name="entries">
+
+        <cfloop query="entries">
+            <cfif arguments.ctl.aborted><cfreturn></cfif>
+            <cfif checkStopTimeout(arguments.ctl)><cfreturn></cfif>
+
+            <cfset childPath = entries.directory & "\" & entries.name>
+            <cfset touchJob(arguments.repoId, arguments.summary, childPath)>
+            <cfif (getTickCount() - arguments.ctl.lastDbTick) gte arguments.ctl.snapshotEveryMs>
+                <cfset snapshotRun(arguments.repoId)>
+                <cfset arguments.ctl.lastDbTick = getTickCount()>
+            </cfif>
+
+            <cfif entries.type eq "Dir">
+                <!--- prune excluded directories (trailing slash so \.git\ etc match) --->
+                <cfif NOT isExcluded(childPath & "\", arguments.excludes)>
+                    <cfset walkAndIngest(arguments.repoId, arguments.repoPath, childPath, arguments.allowedExt, arguments.excludes, arguments.maxBytes, arguments.summary, arguments.seenPaths, arguments.ctl)>
+                </cfif>
+            <cfelse>
+                <!--- file: extension, size and path-substring filters --->
+                <cfset thisExt = lcase(listLast(entries.name, "."))>
+                <cfif NOT listFindNoCase(arguments.allowedExt, thisExt)><cfcontinue></cfif>
+                <cfif arguments.maxBytes gt 0 AND entries.size gt arguments.maxBytes><cfcontinue></cfif>
+                <cfif isExcluded(childPath, arguments.excludes)><cfcontinue></cfif>
+
+                <cfset relPath = relativePath(arguments.repoPath, childPath)>
+                <cfset arguments.seenPaths[lcase(relPath)] = true>
+                <cfset arguments.summary.scanned++>
+                <cfset processFile(arguments.repoId, childPath, relPath, entries.size, entries.dateLastModified, thisExt, arguments.summary)>
+            </cfif>
+        </cfloop>
+    </cffunction>
+
+    <!--- Index one file: fast-path on size+mtime, else hash to confirm a real
+          change, then upsert + (re-)embed. Mutates the shared summary struct. --->
+    <cffunction name="processFile" access="private" returntype="void" output="false">
+        <cfargument name="repoId"    type="numeric" required="true">
+        <cfargument name="fullPath"  type="string"  required="true">
+        <cfargument name="relPath"   type="string"  required="true">
+        <cfargument name="fileSize"  type="numeric" required="true">
+        <cfargument name="fileMtime" type="any"     required="true">
+        <cfargument name="thisExt"   type="string"  required="true">
+        <cfargument name="summary"   type="struct"  required="true">
+
+        <cfset var existing = "">
+        <cfset var content = "">
+        <cfset var fileHash = "">
+        <cfset var fileId = 0>
+        <cfset var currMtime = mtimeToken(arguments.fileMtime)>
+
+        <cftry>
+            <cfquery name="existing" attributeCollection="#request.queryAttributes#">
+                select file_id, file_hash, size_bytes, last_modified, is_deleted
+                from code_files
+                where repo_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#arguments.repoId#">
+                  and relative_path = <cfqueryparam cfsqltype="cf_sql_nvarchar" value="#arguments.relPath#" maxlength="500">
+            </cfquery>
+
+            <!--- FAST PATH: size + mtime unchanged - skip without reading. --->
+            <cfif existing.recordCount AND existing.is_deleted eq 0
+                  AND existing.size_bytes eq arguments.fileSize
+                  AND len(existing.last_modified) AND existing.last_modified eq currMtime>
+                <cfset arguments.summary.skipped++>
+                <cfreturn>
+            </cfif>
+
+            <cffile action="read" file="#arguments.fullPath#" variable="content" charset="utf-8">
+            <cfset fileHash = lcase(hash(content, "SHA-256"))>
+
+            <cfif existing.recordCount AND existing.is_deleted eq 0 AND existing.file_hash eq fileHash>
+                <!--- content identical, only the stamp drifted - refresh + skip --->
+                <cfquery attributeCollection="#request.queryAttributes#">
+                    update code_files
+                    set size_bytes = <cfqueryparam cfsqltype="cf_sql_integer" value="#arguments.fileSize#">,
+                        last_modified = <cfqueryparam cfsqltype="cf_sql_varchar" value="#currMtime#" maxlength="20">,
+                        indexed_at = getDate()
+                    where file_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#existing.file_id#">
+                </cfquery>
+                <cfset arguments.summary.skipped++>
+                <cfreturn>
+            </cfif>
+
+            <!--- new or genuinely changed - upsert and re-embed --->
+            <cfif existing.recordCount>
+                <cfset fileId = existing.file_id>
+                <cfset arguments.summary.changed++>
+                <cfquery attributeCollection="#request.queryAttributes#">
+                    update code_files
+                    set file_hash = <cfqueryparam cfsqltype="cf_sql_char" value="#fileHash#" maxlength="64">,
+                        size_bytes = <cfqueryparam cfsqltype="cf_sql_integer" value="#arguments.fileSize#">,
+                        language = <cfqueryparam cfsqltype="cf_sql_varchar" value="#arguments.thisExt#" maxlength="50">,
+                        last_modified = <cfqueryparam cfsqltype="cf_sql_varchar" value="#currMtime#" maxlength="20">,
+                        is_deleted = 0,
+                        indexed_at = getDate()
+                    where file_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#fileId#">
+                </cfquery>
+                <cfset variables.store.deleteChunksForFile(fileId)>
+            <cfelse>
+                <cfset arguments.summary.newFiles++>
+                <cfset fileId = insertFileRow(arguments.repoId, arguments.relPath, fileHash, arguments.fileSize, arguments.thisExt, currMtime)>
+            </cfif>
+
+            <cfset arguments.summary.chunksWritten += embedFileChunks(arguments.repoId, fileId, arguments.relPath, content)>
+
+            <cfcatch type="any">
+                <cfset arrayAppend(arguments.summary.errors, arguments.relPath & " :: " & cfcatch.message)>
+                <!--- a half-embedded file would otherwise be hash-skipped forever;
+                      blank its hash so it retries next run --->
                 <cfif fileId gt 0>
                     <cftry>
                         <cfquery attributeCollection="#request.queryAttributes#">
@@ -250,24 +591,8 @@
                     </cftry>
                 </cfif>
             </cfcatch>
-            </cftry>
-        </cfloop>
-
-        <!--- mark files that vanished from disk --->
-        <cfset summary.deleted = markMissingFiles(repo.repo_id, seenPaths)>
-
-        <!--- stamp last_indexed --->
-        <cfquery attributeCollection="#request.queryAttributes#">
-            update repos set last_indexed = getDate()
-            where repo_id = <cfqueryparam cfsqltype="cf_sql_integer" value="#repo.repo_id#">
-        </cfquery>
-
-        <cfreturn summary>
+        </cftry>
     </cffunction>
-
-    <!--- ====================================================================
-          Helpers
-          ==================================================================== --->
 
     <cffunction name="insertFileRow" access="private" returntype="numeric" output="false">
         <cfargument name="repoId"   type="numeric" required="true">

@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"/mnt/c/Windows/System32/cmd.exe\" /c \"sqlcmd -S localhost -E -C -d CodeRepos -h -1 -W -Q \\\\\"SELECT 'connections='+CAST\\(COUNT\\(*\\) AS varchar\\) FROM sys.dm_exec_connections; SELECT 'active_requests='+CAST\\(COUNT\\(*\\) AS varchar\\) FROM sys.dm_exec_requests WHERE session_id>50; SELECT 'blocked='+CAST\\(COUNT\\(*\\) AS varchar\\) FROM sys.dm_exec_requests WHERE blocking_session_id<>0; SELECT 'chunks='+CAST\\(COUNT\\(*\\) AS varchar\\) FROM dbo.code_chunks WITH \\(NOLOCK\\)\\\\\"\")",
+      "Bash(grep -vE \"^$\")",
+      "Bash(curl -s \"http://localhost/VirtualDavid/admin/ingest_run.cfm?repoId=1\" --max-time 600)",
+      "Bash(curl -s \"http://localhost/VirtualDavid/admin/ingest_status.cfm?repoId=1\" --max-time 20)",
+      "PowerShell(& sqlcmd -S localhost -E -C -d CodeRepos -h -1 -W -Q \"SELECT 'run: id='+CAST\\(ingest_run_id AS varchar\\)+' status='+status+' scanned='+CAST\\(scanned AS varchar\\)+' skipped='+CAST\\(skipped AS varchar\\)+' finished='+ISNULL\\(CONVERT\\(varchar,finished_at,120\\),'null'\\) FROM ingest_runs WHERE repo_id=1 ORDER BY ingest_run_id DESC; SELECT 'repo last_indexed='+ISNULL\\(CONVERT\\(varchar,last_indexed,120\\),'null'\\) FROM repos WHERE repo_id=1\" 2>&1 | Where-Object { $_ -match '=' })",
+      "Bash(grep -oiE \"\\(Connection reset|No more data|allowable time limit|Variable .* undefined|Element .* undefined|Routine .* undefined|Invalid CFML construct|expected a|does not exist\\)[^<]{0,120}\" /tmp/cc3.html)",
+      "Bash(grep -ioE \"CodeRepos.{0,1400}\" \"C:/ColdFusion2025/cfusion/lib/neo-datasource.xml\" 2>/dev/null | head -c 2000)",
+      "Read(//c/ColdFusion2025/cfusion/lib/**)",
+      "PowerShell(& sqlcmd -S localhost -E -C -d CodeRepos -W -Q $q 2>&1)",
+      "PowerShell(& sqlcmd -S localhost -E -C -W -Q $q 2>&1)",
+      "Bash(grep -ioE \"CodeRepos.{0,2500}\" \"C:/ColdFusion2025/cfusion/lib/neo-datasource.xml\")"
+    ]
+  }
+}
