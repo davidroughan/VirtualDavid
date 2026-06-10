@@ -20,6 +20,7 @@
     --->
     <cffunction name="answer" access="public" returntype="struct" output="false">
         <cfargument name="question"   type="string"  required="true">
+        <cfargument name="history"    type="array"   required="false" default="#arrayNew(1)#">
         <cfargument name="topK"       type="numeric" required="false" default="0">
         <cfargument name="repoFilter" type="string"  required="false" default="">
 
@@ -32,14 +33,24 @@
         <cfset var chat = "">
         <cfset var sourceIds = "">
         <cfset var msgs = "">
+        <cfset var priorTurns = "">
+        <cfset var retrievalQuery = "">
+        <cfset var turn = "">
 
         <cfif NOT len(trim(arguments.question))>
             <cfset out.error = "Empty question.">
             <cfreturn out>
         </cfif>
 
-        <!--- 1. embed the question --->
-        <cfset qEmb = variables.oai.callEmbeddings(inputText = trim(arguments.question), purpose = "ask_embedding")>
+        <!--- Normalise prior conversation turns (keep only valid user/assistant
+              roles with text content, cap to the most recent N to bound tokens). --->
+        <cfset priorTurns = sanitizeHistory(arguments.history)>
+
+        <!--- 1. embed the question. For terse follow-ups ("what about errors?")
+              the bare question retrieves poorly, so fold in the most recent prior
+              user turn to give the embedding some topical anchor. --->
+        <cfset retrievalQuery = buildRetrievalQuery(trim(arguments.question), priorTurns)>
+        <cfset qEmb = variables.oai.callEmbeddings(inputText = retrievalQuery, purpose = "ask_embedding")>
         <cfif NOT qEmb.success>
             <cfset out.error = "Could not embed question: " & qEmb.errorMessage>
             <cfreturn out>
@@ -51,11 +62,13 @@
         <!--- 3. build the grounded system prompt --->
         <cfset systemText = buildSystemPrompt(hits)>
 
-        <!--- 4. call the chat model (serializeJSON handles all escaping) --->
-        <cfset msgs = [
-            { "role" = "system", "content" = systemText },
-            { "role" = "user",   "content" = trim(arguments.question) }
-        ]>
+        <!--- 4. call the chat model (serializeJSON handles all escaping).
+              messages = system (fresh context for this turn) + prior turns + current question. --->
+        <cfset msgs = [ { "role" = "system", "content" = systemText } ]>
+        <cfloop array="#priorTurns#" index="turn">
+            <cfset arrayAppend(msgs, turn)>
+        </cfloop>
+        <cfset arrayAppend(msgs, { "role" = "user", "content" = trim(arguments.question) })>
         <!--- javaCast to int so serializeJSON emits "4000", not "4000.0" (Azure
               rejects a decimal for this integer field). --->
         <cfset jsonBody = serializeJSON({
@@ -98,6 +111,7 @@
         <cfset var persona = "">
         <cfset var sb = "">
         <cfset var i = 0>
+        <cfset var kind = "">
 
         <!--- David's persona, edited via admin/prompt.cfm and stored in the DB so
               the prod 'ask' module reads it from the shared database (no reliance
@@ -105,22 +119,29 @@
               hardcoded persona if the row is missing. --->
         <cfset persona = variables.prompts.getContent()>
 
+        <!--- Retrieval mixes two kinds of chunk: CODE (real codebases + email
+              guidance about the code) and PERSONAL (David's own tweets/profile -
+              his views and voice). The grounding rules differ per kind, so each
+              chunk is tagged below and the model is told how to use each. --->
         <cfsavecontent variable="sb"><cfoutput>#persona#
 
 ---
-You are answering questions from other developers about David's codebases. Ground every answer in the CODE CONTEXT below, which was retrieved by semantic search for this question.
+You are David, answering in an ongoing conversation (earlier messages may set up follow-ups). The CONTEXT below was freshly retrieved by semantic search for the latest question. Each entry is tagged by source:
+- [CODE] = a chunk from David's codebases (or his email guidance about that code). The source repo/path is shown.
+- [PERSONAL] = David's own words from his Twitter/X history or profile - his opinions, views and voice.
 
 Rules:
-- Use ONLY the code context to answer questions about how the code works. If the context does not contain the answer, say so plainly - do not invent code, file names, or behaviour.
-- When you reference code, cite it as path:startLine-endLine so the developer can find it.
-- Stay in David's voice: direct, concise, tradeoffs surfaced, no fluff.
+- For questions about how code works or how something is built, answer from [CODE] entries only. If they don't contain the answer, say so plainly - do not invent code, file names, or behaviour. Cite code as path:startLine-endLine.
+- For questions about what David thinks, his opinions, or anything outside the code, answer from [PERSONAL] entries, as David, in his voice. No file citations for these. If the context doesn't show his view on it, say you're not sure rather than inventing one - don't put words in his mouth.
+- Use the conversation so far to resolve what a follow-up refers to, but ground each answer in the CONTEXT below - it is refreshed each turn and is the source of truth.
+- Stay in David's voice throughout: direct, concise, tradeoffs surfaced, no fluff.
 
-=== CODE CONTEXT ===
-<cfif arguments.hits.recordCount eq 0>(no relevant code was found for this question)
-<cfelse><cfloop query="arguments.hits">[#arguments.hits.currentRow#] #arguments.hits.repo_name#/#arguments.hits.relative_path# (lines #arguments.hits.start_line#-#arguments.hits.end_line#) score=#numberFormat(arguments.hits.score, "0.000")#
+=== CONTEXT ===
+<cfif arguments.hits.recordCount eq 0>(nothing relevant was retrieved for this question)
+<cfelse><cfloop query="arguments.hits"><cfset kind = (arguments.hits.repo_name eq "Twitter") ? "PERSONAL" : "CODE">[#arguments.hits.currentRow#] [#kind#] #arguments.hits.repo_name#/#arguments.hits.relative_path# (lines #arguments.hits.start_line#-#arguments.hits.end_line#) score=#numberFormat(arguments.hits.score, "0.000")#
 #arguments.hits.content#
 
-</cfloop></cfif>=== END CODE CONTEXT ===</cfoutput></cfsavecontent>
+</cfloop></cfif>=== END CONTEXT ===</cfoutput></cfsavecontent>
 
         <cfreturn sb>
     </cffunction>
@@ -137,6 +158,61 @@ Rules:
             })>
         </cfloop>
         <cfreturn arr>
+    </cffunction>
+
+    <!--- ====================================================================
+          Conversation history
+          ==================================================================== --->
+
+    <cffunction name="sanitizeHistory" access="private" returntype="array" output="false"
+        hint="Coerces client-supplied history into a clean [{role,content}] array: only user/assistant roles with non-empty string content, capped to the most recent maxTurns to bound prompt size.">
+        <cfargument name="history"  type="array"   required="true">
+        <cfargument name="maxTurns" type="numeric" required="false" default="12">
+
+        <cfset var clean = []>
+        <cfset var item = "">
+        <cfset var role = "">
+        <cfset var content = "">
+        <cfset var startIdx = 1>
+
+        <cfloop array="#arguments.history#" index="item">
+            <cfif NOT isStruct(item) OR NOT structKeyExists(item, "role") OR NOT structKeyExists(item, "content")>
+                <cfcontinue>
+            </cfif>
+            <cfset role = lcase(trim(item.role))>
+            <cfset content = trim(toString(item.content))>
+            <cfif (role eq "user" OR role eq "assistant") AND len(content)>
+                <cfset arrayAppend(clean, { "role" = role, "content" = content })>
+            </cfif>
+        </cfloop>
+
+        <!--- keep only the most recent maxTurns messages --->
+        <cfif arrayLen(clean) gt arguments.maxTurns>
+            <cfset startIdx = arrayLen(clean) - arguments.maxTurns + 1>
+            <cfreturn arraySlice(clean, startIdx, arguments.maxTurns)>
+        </cfif>
+        <cfreturn clean>
+    </cffunction>
+
+    <cffunction name="buildRetrievalQuery" access="private" returntype="string" output="false"
+        hint="Anchors a terse follow-up with the most recent prior user turn so semantic search has topical context to match against.">
+        <cfargument name="question"   type="string" required="true">
+        <cfargument name="priorTurns" type="array"  required="true">
+
+        <cfset var i = 0>
+        <cfset var lastUser = "">
+
+        <cfloop from="#arrayLen(arguments.priorTurns)#" to="1" index="i" step="-1">
+            <cfif arguments.priorTurns[i].role eq "user">
+                <cfset lastUser = arguments.priorTurns[i].content>
+                <cfbreak>
+            </cfif>
+        </cfloop>
+
+        <cfif len(lastUser)>
+            <cfreturn lastUser & chr(10) & arguments.question>
+        </cfif>
+        <cfreturn arguments.question>
     </cffunction>
 
     <!--- ====================================================================

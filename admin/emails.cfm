@@ -102,7 +102,7 @@
 <div class="wrap">
     <h1>Emails</h1>
     <p class="sub">Read saved emails (.eml / .msg) and store David's guidance for retrieval. &middot;
-        <a href="ingest.cfm">repos</a> &middot; <a href="prompt.cfm">system prompt</a> &middot; <a href="../index.cfm">ask</a></p>
+        <a href="ingest.cfm">repos</a> &middot; <a href="twitter.cfm">twitter</a> &middot; <a href="prompt.cfm">system prompt</a> &middot; <a href="../index.cfm">ask</a></p>
 
     <cfif len(notice)>
         <div class="notice #noticeClass#">#encodeForHTML(notice)#</div>
